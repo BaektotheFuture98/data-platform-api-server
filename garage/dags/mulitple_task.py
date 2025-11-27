@@ -1,18 +1,17 @@
 from airflow.decorators import task, dag
 from airflow.models import Variable
 from airflow.exceptions import AirflowFailException
-from datetime import datetime, timezone 
+from datetime import datetime, timezone # 💡 days_ago 대신 datetime과 timezone 사용
 import json
 
 # ==========================================
-# 1. Helper Functions
+# 1. Helper Functions (설정 및 스키마 생성)
 # ==========================================
 
 def _make_avro_schema(project_name: str, fields: list) -> str:
-    """Avro 스키마 JSON 문자열 생성 (모든 청크에서 동일한 구조 사용)"""
+    """Avro 스키마 JSON 문자열 생성"""
     avro_fields = []
     for field_name in fields:
-        # 간단한 타입 매핑 (필요시 정교하게 수정)
         field_type = "int" if "date" in field_name or "id" in field_name else "string"
         avro_fields.append({"name": field_name, "type": ["null", field_type], "default": None})
 
@@ -25,17 +24,11 @@ def _make_avro_schema(project_name: str, fields: list) -> str:
     return json.dumps(data_schema, ensure_ascii=False)
 
 def _connect_config(param: dict, chunk_index: int) -> dict:
-    """
-    청크(테이블) 별 커넥터 설정 생성
-    """
-    # 환경 변수 (Airflow Variables) 사용
+    """청크(테이블) 별 커넥터 설정 생성"""
     schema_registry_url = Variable.get("SCHEMA_REGISTRY_URL")
     
-    # 10만건 분할에 따른 Naming (0, 1, 2...)
     suffix = f"-{chunk_index}"
     topic_name = f"{param['project_name']}-topic{suffix}"
-    
-    # DB 테이블 이름 분할 (예: mytable_0, mytable_1)
     target_table_name = f"{param['table']}_{chunk_index}" 
     connector_name = f"{param['project_name']}-SinkConnector{suffix}"
 
@@ -46,19 +39,14 @@ def _connect_config(param: dict, chunk_index: int) -> dict:
             "tasks.max": "1",
             "topics": topic_name,
             
-            # Connection Info
             "connection.url": f"jdbc:mysql://{param['host']}/{param['database']}",
             "connection.user": param["user"],
             "connection.password": param["password"],
             
-            # Table Format
             "table.name.format": target_table_name,
             "auto.create": "true",
             "auto.evolve": "true",
-            "insert.mode": "upsert", # 필요 시 설정
-            "pk.mode": "none",       # PK 설정 필요 시 변경
             
-            # Converters
             "key.converter": "org.apache.kafka.connect.storage.StringConverter",
             "value.converter": "io.confluent.connect.avro.AvroConverter",
             "value.converter.schema.registry.url": schema_registry_url,
@@ -82,10 +70,9 @@ def plan_job(**kwargs) -> dict:
     if not param:
         raise AirflowFailException("No configuration received from API Trigger.")
 
-    # ES 연결 및 Count 조회
+    # ES 연결 및 Count 조회 로직 (이전 코드와 동일)
     from airflow.providers.elasticsearch.hooks.elasticsearch import ElasticsearchPythonHook
     es_hosts = [host.strip() for host in Variable.get("ELASTICSEARCH_HOSTS").split(",")]
-    # Note: ES 연결 시 사용자 인증 정보는 필요에 따라 변경하세요.
     es_hook = ElasticsearchPythonHook(es_hosts=es_hosts, conn_kwargs={"basic_auth": ("elastic", "elastic")})
     
     try:
@@ -94,16 +81,15 @@ def plan_job(**kwargs) -> dict:
     except Exception as e:
         raise AirflowFailException(f"Failed to query Elasticsearch: {e}")
 
-    # 청크 계산 (10만건 단위)
     chunk_size = 100000
     num_chunks = (total_count // chunk_size) + (1 if total_count % chunk_size > 0 else 0)
     if num_chunks == 0: num_chunks = 1 
 
-    print(f"✂️ Plan: Need {num_chunks} tables/topics. Service: {param.get('service')}")
+    print(f"✂️ Plan: Need {num_chunks} tables/topics for {total_count} records. Service: {param.get('service')}")
 
     return {
         "base_param": param,
-        "chunks": list(range(num_chunks)), # 👈 DTM 처리를 위해 딕셔너리에 'chunks' 포함
+        "chunks": list(range(num_chunks)),
         "chunk_size": chunk_size,
         "schema_str": _make_avro_schema(param["project_name"], param["fields"])
     }
@@ -124,51 +110,40 @@ def router(plan_info: dict) -> str:
     else:
         raise AirflowFailException(f"Unsupported service type: {service}")
 
-# ==========================================
-# 💡 Dynamic Mapping 오류 해결을 위한 Task
-# ==========================================
-
-@task(task_id="extract_chunks")
-def extract_chunks(plan_info: dict) -> list:
-    """
-    plan_job의 결과 딕셔너리에서 매핑에 필요한 'chunks' 리스트만 추출하여 
-    DTM이 인식하는 표준 'return_value'로 반환합니다.
-    """
-    return plan_info["chunks"]
-
-# ==========================================
-# 2. Core Tasks (Mapper 및 Sink) 계속...
-# ==========================================
-
 @task(task_id="register_schema_mapped")
 def register_schema_mapped(chunk_index: int, base_param: dict, schema_str: str):
     """[Mapped Task] 각 청크(Topic)별로 동일한 스키마를 등록"""
-    # Note: 이 Task가 실행되려면 confluent_kafka 및 schema_registry.client 라이브러리가 필요합니다.
     from schema_registry.client import SchemaRegistryClient, schema
     schema_registry_url = Variable.get("SCHEMA_REGISTRY_URL")
     client = SchemaRegistryClient(url=schema_registry_url)
     topic_name = f"{base_param['project_name']}-topic-{chunk_index}"
     subject = f"{topic_name}-value"
     avro_schema = schema.AvroSchema(schema_str)
-    client.register(subject, avro_schema)
-    print(f"✅ Schema registered for subject: {subject}")
+    schema_id = client.register(subject, avro_schema)
+    print(f"✅ Schema registered for subject: {subject} (ID: {schema_id})")
+    return schema_id
 
 @task(task_id="create_connector_mapped")
 def create_connector_mapped(chunk_index: int, base_param: dict) -> str:
     """[Mapped Task] 각 청크(Table)별로 Sink Connector 생성"""
-    # Note: 이 Task가 실행되려면 사용자 정의 'kafka_connect' 모듈이 필요합니다.
     from kafka_connect import KafkaConnect 
     client = KafkaConnect(Variable.get("CONNECT_BOOTSTRAP_SERVERS"))
     config = _connect_config(base_param, chunk_index)
-    client.create_connector(config) # 실제 환경에서는 response code 확인 및 오류 처리 필요
+    
+    try:
+        response = client.create_connector(config)
+        if response.status_code >= 400 and response.status_code != 409:
+             raise AirflowFailException(f"Connector creation failed: {response.text}")
+    except Exception as e:
+        raise AirflowFailException(f"Connector error: {e}")
+        
     print(f"✅ Connector {config['name']} created/verified.")
     return config['name']
 
 @task(task_id="ingest_data_router")
 def ingest_data_router(plan_info: dict):
     """[Single Task] 데이터를 읽어서 건수에 따라 알맞은 토픽으로 라우팅하며 전송"""
-    # Note: 실제 Kafka Producer 및 ES Scroll 로직이 여기에 구현되어야 합니다.
-    # from confluent_kafka import SerializingProducer, ...
+    # ... (Confluent Kafka Producer 및 ES Scroll 로직 구현 - 생략) ...
     print(f"🚀 Data ingestion completed for {len(plan_info['chunks'])} chunks.")
     return plan_info
 
@@ -178,8 +153,11 @@ def delete_connectors_mapped(connector_name: str):
     from kafka_connect import KafkaConnect
     if not connector_name: return
     client = KafkaConnect(Variable.get("CONNECT_BOOTSTRAP_SERVERS"))
-    client.delete_connector(connector_name)
-    print(f"🗑️ Connector {connector_name} deleted.")
+    response = client.delete_connector(connector_name)
+    if 200 <= response.status_code < 300 or response.status_code == 404:
+        print(f"🗑️ Connector {connector_name} deleted.")
+    else:
+        print(f"⚠️ Failed to delete connector {connector_name}: {response.text}")
 
 # --- Service Specific Dummy Start Tasks ---
 
@@ -191,12 +169,12 @@ def mysql_start_flow(plan_info: dict) -> dict:
 
 @task(task_id="elasticsearch_start_flow")
 def elasticsearch_start_flow(plan_info: dict):
-    """Elasticsearch 인덱싱 Flow 시작 지점 (현재 미구현)"""
+    """Elasticsearch 인덱싱 Flow 시작 지점"""
     raise NotImplementedError("Elasticsearch indexing flow not implemented yet.")
 
 @task(task_id="excel_export_start_flow")
 def excel_export_start_flow(plan_info: dict):
-    """Excel 파일 Export Flow 시작 지점 (현재 미구현)"""
+    """Excel 파일 Export Flow 시작 지점"""
     raise NotImplementedError("Excel export flow not implemented yet.")
 
 
@@ -208,49 +186,41 @@ def excel_export_start_flow(plan_info: dict):
     dag_id="es_to_dynamic_sink_pipeline",
     # 💡 Airflow 3.x 호환: days_ago 대신 명시적 datetime 및 UTC timezone 사용
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc), 
-    schedule=None, # API Trigger 전용
+    schedule=None,
     catchup=False
 )
 def migration_pipeline():
     
-    # 1. 계획 수립 및 라우팅
+    # 1. 계획 수립 및 서비스 라우팅
     plan = plan_job()
     router_task = router(plan)
 
-    # 2. Dynamic Mapping 오류 해결을 위한 청크 추출
-    chunks_list = extract_chunks(plan) 
-
-    # 3. MySQL 경로 시작
+    # 2. MySQL 경로 시작 (대용량 분할 로직)
     mysql_starter = mysql_start_flow(plan)
 
-    # 4. 스키마 및 커넥터 인프라 구축 (Dynamic Mapping)
-    # base_param과 schema_str은 plan 객체에서 partial로 전달
+    # 2-1. 스키마 및 커넥터 인프라 구축 (Dynamic Mapping)
     schema_strs = register_schema_mapped.partial(
         base_param=plan["base_param"], 
         schema_str=plan["schema_str"]
-    ).expand(chunk_index=chunks_list) # 👈 extract_chunks의 return_value 사용
+    ).expand(chunk_index=plan["chunks"])
 
     connector_names = create_connector_mapped.partial(
         base_param=plan["base_param"]
-    ).expand(chunk_index=chunks_list) # 👈 extract_chunks의 return_value 사용
+    ).expand(chunk_index=plan["chunks"])
 
-    # 5. 데이터 전송 및 클린업
+    # 2-2. 데이터 전송
     ingestion = ingest_data_router(plan_info=plan)
+
+    # 2-3. 커넥터 삭제 (클린업)
     clean_up = delete_connectors_mapped.expand(connector_name=connector_names)
 
     # 의존성 연결
-    # 라우터 -> 스타터 -> 청크 추출
     router_task >> mysql_starter
-    mysql_starter >> chunks_list
-    
-    # 청크 추출 -> 인프라 구축
-    chunks_list >> [schema_strs, connector_names]
-    
-    # 인프라 구축 완료 -> 데이터 전송 -> 클린업
+    mysql_starter >> [schema_strs, connector_names]
     connector_names >> ingestion
     ingestion >> clean_up
     
-    # 기타 경로 연결
+    # 3. 기타 경로 연결
     router_task >> [
         elasticsearch_start_flow(plan),
         excel_export_start_flow(plan)

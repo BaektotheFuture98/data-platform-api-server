@@ -11,6 +11,7 @@ class Schema(BaseModel) :
     host : str
     database : str
     table : str
+    table_per_date : bool = False
     user : str        
     password : str
     elasticsearch_index : str
@@ -43,14 +44,4 @@ class Schema(BaseModel) :
         return value
     
     def to_dict(self):
-        return {
-            "project_name": self.project_name,
-            "query": self.query,
-            "host": self.host,
-            "database": self.database,
-            "table": self.table,
-            "user": self.user,
-            "password": self.password,
-            "elasticsearch_index": self.elasticsearch_index,
-            "fields": self.fields
-        }
+        return self.model_dump()
