@@ -1,4 +1,4 @@
-from airflow.decorators import task, dag
+from airflow.sdk import task, dag
 from airflow.models import Variable
 from airflow.exceptions import AirflowFailException
 from datetime import datetime, timezone # 💡 days_ago 대신 datetime과 timezone 사용
@@ -184,7 +184,6 @@ def excel_export_start_flow(plan_info: dict):
 
 @dag(
     dag_id="es_to_dynamic_sink_pipeline",
-    # 💡 Airflow 3.x 호환: days_ago 대신 명시적 datetime 및 UTC timezone 사용
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc), 
     schedule=None,
     catchup=False
@@ -214,7 +213,7 @@ def migration_pipeline():
     # 2-3. 커넥터 삭제 (클린업)
     clean_up = delete_connectors_mapped.expand(connector_name=connector_names)
 
-    # 의존성 연결
+    # 의존성 연결 
     router_task >> mysql_starter
     mysql_starter >> [schema_strs, connector_names]
     connector_names >> ingestion

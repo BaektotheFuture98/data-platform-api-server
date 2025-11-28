@@ -2,45 +2,30 @@ from pydantic import BaseModel, field_validator
 import json
 
 schema_field = ["an_title" ,"in_date", "kw_docid", "an_content"]
-services = ["mysql", "elasticsearch", "excel"]
-
 class Schema(BaseModel) : 
-    service : str = "mysql"
     project_name : str
     query : dict
     host : str
     database : str
     table : str
-    table_per_date : bool = False
     user : str        
     password : str
     elasticsearch_index : str
     fields : list[str]
 
-    @field_validator("service")
-    def validate_service(cls, value) : 
-        if value not in services : 
-            raise ValueError(f"Invalid service: {value}. Must be one of {services}")
-        return value
-
     @field_validator("fields")
     def validate_fields(cls, value):
-        if not isinstance(value, (list, tuple)) : 
-            raise TypeError("'fields' must be a list of field names")
-        invalid = [item for item in value if item not in schema_field]
-        if invalid : 
-            raise ValueError(f"Invalid fields: {invalid}. Allowed: {schema_field}")
-        return list(value)
+        if not all(item in schema_field for item in value):
+            raise ValueError(f"Invalid fields: {value}. Must be a subset of {schema_field}")
+        return value 
     
     @field_validator("query")
     def validate_query(cls, value):
         if not isinstance(value, dict):
             raise ValueError(f"'query' must be a dict, got {type(value).__name__}")
         try:
+            # JSON으로 직렬화 가능한지 체크
             json.dumps(value)
         except (TypeError, ValueError) as e:
             raise ValueError(f"'query' must be JSON serializable: {e}")
         return value
-    
-    def to_dict(self):
-        return self.model_dump()
